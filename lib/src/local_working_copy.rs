@@ -458,7 +458,7 @@ pub struct TreeState {
     /// Watchman has been queried at least once.
     watchman_clock: Option<crate::protos::working_copy::WatchmanClock>,
 
-    target_eol_strategy: Arc<eol::TargetEolStrategy>,
+    target_eol_strategy: Arc<dyn eol::TargetEolStrategy>,
 }
 
 fn file_state_from_proto(proto: &crate::protos::working_copy::FileState) -> FileState {
@@ -808,7 +808,7 @@ impl TreeState {
 
     fn empty(store: Arc<Store>, working_copy_path: PathBuf, state_path: PathBuf) -> TreeState {
         let tree_id = store.empty_merged_tree_id();
-        let target_eol_strategy = Arc::new(eol::TargetEolStrategy::new(Arc::clone(&store)));
+        let target_eol_strategy = eol::get_target_eol_strategy(&store).into();
         TreeState {
             store,
             working_copy_path,
@@ -1184,7 +1184,7 @@ struct FileSnapshotter<'a> {
     progress: Option<&'a SnapshotProgress<'a>>,
     max_new_file_size: u64,
     conflict_marker_style: ConflictMarkerStyle,
-    target_eol_strategy: Arc<eol::TargetEolStrategy>,
+    target_eol_strategy: Arc<dyn eol::TargetEolStrategy>,
 }
 
 impl FileSnapshotter<'_> {
