@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::Read as _;
+use std::collections::VecDeque;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -53,19 +54,22 @@ impl TargetEolStrategy for GitTargetEolStrategy {
     fn get_snapshot_reader_target_eol(
         &self,
         file_path: &Path,
-        content: &mut std::io::BufReader<std::fs::File>,
+        content: &mut Box<dyn std::io::Read + Send>,
     ) -> TargetEol {
-        fn is_file_binary(file: &mut std::io::BufReader<std::fs::File>) -> Option<bool> {
-            let mut first = file.by_ref().take(PROBE_SIZE as u64);
+        fn is_file_binary(file: &mut Box<dyn std::io::Read + Send>) -> Option<bool> {
+            let mut first = file.take(PROBE_SIZE as u64);
             let mut content = Vec::with_capacity(PROBE_SIZE);
-            let read_result = first.read_to_end(&mut content).ok();
-            let _ = file.seek_relative(
-                -(i64::try_from(content.len())
-                    .expect("bytes read shouldn't be larger than PROBE_SIZE")),
+            let result = first.read_to_end(&mut content).ok().map(|_| {
+                let stats = Stats::from_bytes(&content);
+                stats.is_binary()
+            });
+            let dummy_reader = Box::new([].as_slice()) as Box<dyn std::io::Read + Send>;
+            let cached_file = Read::chain(
+                VecDeque::from(content),
+                std::mem::replace(file, dummy_reader),
             );
-            read_result?;
-            let stats = Stats::from_bytes(&content);
-            Some(stats.is_binary())
+            *file = Box::new(cached_file);
+            result
         }
 
         if let Some(auto_crlf) = self.auto_crlf {

@@ -1572,7 +1572,10 @@ impl FileSnapshotter<'_> {
                         message: format!("Failed to open file {}", disk_path.display()),
                         err: err.into(),
                     })?;
-            let mut disk_file = std::io::BufReader::with_capacity(eol::PROBE_SIZE, disk_file);
+            let mut disk_file = Box::new(std::io::BufReader::with_capacity(
+                eol::PROBE_SIZE,
+                disk_file,
+            )) as Box<dyn std::io::Read + Send>;
             let mut content = vec![];
             let target_eol = self
                 .target_eol_strategy
@@ -1633,7 +1636,8 @@ impl FileSnapshotter<'_> {
             message: format!("Failed to open file {}", disk_path.display()),
             err: err.into(),
         })?;
-        let mut file = std::io::BufReader::with_capacity(eol::PROBE_SIZE, file);
+        let mut file = Box::new(std::io::BufReader::with_capacity(eol::PROBE_SIZE, file))
+            as Box<dyn std::io::Read + Send>;
         let target_eol = self
             .target_eol_strategy
             .get_snapshot_reader_target_eol(disk_path, &mut file);

@@ -53,10 +53,14 @@ pub(crate) enum TargetEol {
 }
 
 pub(crate) trait TargetEolStrategy: Sync + Send {
+    // The implementation can consume bytes from the `content` reader, but if that
+    // happens, the implementation should guarantee that `content` should be
+    // replaced by another reader object that repopulates the consumed bytes at
+    // front.
     fn get_snapshot_reader_target_eol(
         &self,
         file_path: &Path,
-        content: &mut std::io::BufReader<std::fs::File>,
+        content: &mut Box<dyn std::io::Read + Send>,
     ) -> TargetEol;
     fn get_update_writer_target_eol<'a>(
         &'a self,
@@ -88,7 +92,7 @@ impl TargetEolStrategy for DefaultTargetEolStrategy {
     fn get_snapshot_reader_target_eol(
         &self,
         _file_path: &Path,
-        _content: &mut std::io::BufReader<std::fs::File>,
+        _content: &mut Box<dyn std::io::Read + Send>,
     ) -> TargetEol {
         TargetEol::PassThrough
     }
