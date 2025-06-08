@@ -1692,19 +1692,23 @@ impl TreeState {
                 err: err.into(),
             })?;
         let mut file_writer = file.count_consumed_bytes();
+        let mut buf_file_writer = std::io::BufWriter::with_capacity(4 << 10, file_writer.by_ref());
         // The number of bytes consumed can be different from the number of bytes
         // written due to EOL conversion, so we can't use the return value here to
         // calculate the file size.
-        copy_async_to_sync(contents, &mut file_writer.write_with_eol(target_eol))
+        copy_async_to_sync(contents, &mut buf_file_writer.write_with_eol(target_eol))
             .block_on()
             .map_err(|err| CheckoutError::Other {
                 message: format!("Failed to write file {}", disk_path.display()),
                 err: err.into(),
             })?;
-        file_writer.flush().map_err(|err| CheckoutError::Other {
-            message: format!("Failed to flush to file {}", disk_path.display()),
-            err: err.into(),
-        })?;
+        buf_file_writer
+            .flush()
+            .map_err(|err| CheckoutError::Other {
+                message: format!("Failed to flush to file {}", disk_path.display()),
+                err: err.into(),
+            })?;
+        drop(buf_file_writer);
         let size = file_writer.bytes_consumed();
 
         self.set_executable(disk_path, executable)?;
