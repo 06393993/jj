@@ -63,12 +63,14 @@ impl TargetEolStrategy for GitTargetEolStrategy {
                 let stats = Stats::from_bytes(&content);
                 stats.is_binary()
             });
-            let dummy_reader = Box::new([].as_slice()) as Box<dyn std::io::Read + Send>;
-            let cached_file = Read::chain(
-                VecDeque::from(content),
-                std::mem::replace(file, dummy_reader),
+            replace_with::replace_with(
+                file,
+                || Box::new([].as_slice()),
+                |file| {
+                    let cached_file = Read::chain(VecDeque::from(content), file);
+                    Box::new(cached_file)
+                },
             );
-            *file = Box::new(cached_file);
             result
         }
 
