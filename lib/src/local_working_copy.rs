@@ -1937,8 +1937,21 @@ impl TreeState {
                     continue;
                 }
                 MaterializedTreeValue::File(file) => {
-                    let target_eol = self
-                        .target_eol_strategy
+                    let mut eol_strategies = vec![Arc::clone(&self.target_eol_strategy)];
+                    for ancestor in path.parent().expect("file can't be the root of a repo").ancestors().collect::<Vec<_>>().into_iter().rev() {
+                        let Ok(Some(tree)) = new_tree.sub_tree_recursive(ancestor).await else {
+                            continue;
+                        };
+
+                        let next_eol_strategy = eol_strategies
+                            .last()
+                            .expect("there must be at least one element")
+                            .add_dir_layer_from_store(ancestor, &tree).await;
+                        eol_strategies.push(next_eol_strategy);
+                    }
+                    let target_eol = eol_strategies
+                        .last()
+                        .expect("there must be at least one element")
                         .get_update_writer_target_eol(&path, &file.id)
                         .await;
                     self.write_file(&disk_path, file.reader, file.executable, target_eol)?

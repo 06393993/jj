@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
+use bstr::BStr;
+use bstr::BString;
 use bstr::ByteSlice as _;
+use gix::attrs::StateRef;
 use jj_lib::git_backend::GitBackend;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
@@ -39,6 +42,14 @@ static LF_FILE_CONTENT: &[u8] = b"aaa\nbbbb\nccccc\n";
 static CRLF_FILE_CONTENT: &[u8] = b"aaa\r\nbbbb\r\nccccc\r\n";
 static MIXED_EOL_FILE_CONTENT: &[u8] = b"aaa\nbbbb\r\nccccc\n";
 static BINARY_FILE_CONTENT: &[u8] = include_bytes!("data/binary_file.png");
+
+fn platform_native_file_content() -> &'static [u8] {
+    if cfg!(windows) {
+        CRLF_FILE_CONTENT
+    } else {
+        LF_FILE_CONTENT
+    }
+}
 
 // Tests on binary files don't make sense if it doesn't include CRLF or LF.
 #[test]
@@ -298,3 +309,132 @@ fn test_autocrlf_snapshot_conversion(
 
     std::fs::read(&disk_path).unwrap()
 }
+
+#[derive(Default)]
+struct GitAttributesTestConfig {
+    file_content: &'static [u8],
+    text: Option<StateRef<'static>>,
+    eol: Option<StateRef<'static>>,
+    core_eol: Option<&'static str>,
+}
+
+impl GitAttributesTestConfig {
+    fn build_git_attributes(&self) -> String {
+        let mut attrs = vec![];
+        fn attribute_to_string(attribute_name: &str, state: StateRef) -> String {
+            match state {
+                StateRef::Set => format!("{attribute_name}"),
+                StateRef::Unset => format!("-{attribute_name}"),
+                StateRef::Value(value_ref) => format!("{attribute_name}={}", value_ref.as_bstr()),
+                StateRef::Unspecified => format!("!{attribute_name}"),
+            }
+        }
+        if let Some(state) = self.text {
+            attrs.push(attribute_to_string("text", state));
+        }
+        if let Some(state) = self.eol {
+            attrs.push(attribute_to_string("eol", state));
+        }
+        attrs.join(" ")
+    }
+}
+
+#[test_case(GitAttributesTestConfig {
+    file_content: LF_FILE_CONTENT,
+    ..Default::default()
+} => LF_FILE_CONTENT; "text unspecified eol unspecified LF only file")]
+#[test_case(GitAttributesTestConfig {
+    file_content: CRLF_FILE_CONTENT,
+    ..Default::default()
+} => CRLF_FILE_CONTENT; "text unspecified eol unspecified CRLF only file")]
+#[test_case(GitAttributesTestConfig {
+    file_content: MIXED_EOL_FILE_CONTENT,
+    ..Default::default()
+} => MIXED_EOL_FILE_CONTENT; "text unspecified eol unspecified mixed EOL file")]
+#[test_case(GitAttributesTestConfig {
+    file_content: LF_FILE_CONTENT,
+    text: Some(StateRef::Set),
+    ..Default::default()
+} => platform_native_file_content(); "text set eol unspecified LF only file")]
+#[test_case(GitAttributesTestConfig {
+    file_content: CRLF_FILE_CONTENT,
+    text: Some(StateRef::Set),
+    ..Default::default()
+} => platform_native_file_content(); "text set eol unspecified CRLF only file")]
+#[test_case(GitAttributesTestConfig {
+    file_content: MIXED_EOL_FILE_CONTENT,
+    text: Some(StateRef::Set),
+    ..Default::default()
+} => platform_native_file_content(); "text set eol unspecified mixed EOL file")]
+fn test_git_attributes_text_update_conversion(config: GitAttributesTestConfig) -> Vec<u8> {
+    // This test checks in files with autocrlf=false, so that the store stores files
+    // as is. Then we use jj to check out those files with different matching text,
+    // and eol gitattributes, and core.eol git config to verify if the EOLs are
+    // converted as expected.
+
+    let mut test_workspace = TestWorkspace::init_with_backend(TestRepoBackend::Git);
+    let repo = &test_workspace.repo;
+    let file_name = "test-eol-file";
+    let file_repo_path = repo_path(file_name);
+    let disk_path = file_repo_path
+        .to_fs_path(test_workspace.workspace.workspace_root())
+        .unwrap();
+
+    // Set core.autocrlf to false, so that the input files are stored as is.
+    let git_backend = get_git_backend(repo);
+    set_git_config_value(git_backend, &"core.autocrlf", "false");
+    if let Some(core_eol) = config.core_eol {
+        set_git_config_value(git_backend, &"core.eol", core_eol);
+    }
+
+    // Create 2 commits. One with the test files, one without.
+    let tree = {
+        let mut builder = TestTreeBuilder::new(repo.store().clone());
+        builder.file(file_repo_path, config.file_content);
+        builder.file(
+            repo_path(".gitattributes"),
+            format!("{file_name} {}\n", config.build_git_attributes()),
+        );
+        builder.write_merged_tree()
+    };
+    let file_added_commit = commit_with_tree(repo.store(), tree.id());
+    let tree = create_tree(&repo, &[]);
+    let file_removed_commit = commit_with_tree(repo.store(), tree.id());
+
+    // Check out the commit without the test file to clear the directory, so that
+    // when we check out test files later, those files are recreated.
+    let workspace = &mut test_workspace.workspace;
+    workspace
+        .check_out(
+            repo.op_id().clone(),
+            None,
+            &file_removed_commit,
+            &CheckoutOptions::empty_for_test(),
+        )
+        .unwrap();
+    assert!(!disk_path.exists());
+
+    // Check out the commit with the test file. TreeState::update should update the
+    // EOL accordingly.
+    workspace
+        .check_out(
+            repo.op_id().clone(),
+            None,
+            &file_added_commit,
+            &CheckoutOptions::empty_for_test(),
+        )
+        .unwrap();
+    assert!(disk_path.exists());
+
+    // When we take a snapshot now, the tree may not be clean, because the EOL our
+    // snapshot creates may not align to what is currently used in store. e.g. with
+    // the text attribute set, the test-eol-file may have CRLF line endings in the
+    // store, but the snapshot will change the EOL to LF, hence the diff.
+
+    // The checked out test file should have EOL converted correctly.
+    std::fs::read(&disk_path).unwrap()
+}
+
+// TODO: add test for more complicated file hierarchy.
+// TODO: add test for sparse: .gitattributes missing on the disk, but exists in
+// store.

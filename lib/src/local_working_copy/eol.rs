@@ -26,6 +26,7 @@ pub(crate) use read::ReadExt;
 pub(crate) use write::WriteExt;
 
 use crate::backend::FileId;
+use crate::merged_tree::MergedTree;
 #[cfg(feature = "git")]
 use crate::git_backend::GitBackend;
 use crate::repo_path::RepoPath;
@@ -57,6 +58,8 @@ pub(crate) trait TargetEolStrategy: Sync + Send {
         repo_path: &'a RepoPath,
         file_id: &'a FileId,
     ) -> BoxFuture<'a, TargetEol>;
+    fn add_dir_layer_from_store<'a>(&'a self, repo_path: &'a RepoPath, tree: &'a MergedTree) -> BoxFuture<'a, Arc<dyn TargetEolStrategy>>;
+    fn add_dir_layer_from_disk(&self, disk_path: &Path) -> Arc<dyn TargetEolStrategy>;
 }
 
 pub(crate) fn get_target_eol_strategy(
@@ -89,5 +92,13 @@ impl TargetEolStrategy for DefaultTargetEolStrategy {
         _file_id: &'a FileId,
     ) -> BoxFuture<'a, TargetEol> {
         async { TargetEol::PassThrough }.boxed()
+    }
+
+    fn add_dir_layer_from_store<'a>(&'a self, _repo_path: &'a RepoPath, _tree: &'a MergedTree) -> BoxFuture<'a, Arc<dyn TargetEolStrategy>> {
+        async { Arc::new(Self) as Arc<dyn TargetEolStrategy> }.boxed()
+    }
+
+    fn add_dir_layer_from_disk(&self, _disk_path: &Path) -> Arc<dyn TargetEolStrategy> {
+        Arc::new(Self)
     }
 }
