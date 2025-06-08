@@ -1564,7 +1564,7 @@ impl FileSnapshotter<'_> {
             // If the file contained a conflict before and is a normal file on
             // disk, we try to parse any conflict markers in the file into a
             // conflict.
-            let mut disk_file =
+            let disk_file =
                 File::options()
                     .read(true)
                     .open(disk_path)
@@ -1572,10 +1572,11 @@ impl FileSnapshotter<'_> {
                         message: format!("Failed to open file {}", disk_path.display()),
                         err: err.into(),
                     })?;
+            let mut disk_file = std::io::BufReader::with_capacity(eol::PROBE_SIZE, disk_file);
             let mut content = vec![];
             let target_eol = self
                 .target_eol_strategy
-                .get_snapshot_reader_target_eol(disk_path);
+                .get_snapshot_reader_target_eol(disk_path, &mut disk_file);
             disk_file
                 .read_with_eol(target_eol)
                 .read_to_end(&mut content)
@@ -1628,13 +1629,14 @@ impl FileSnapshotter<'_> {
         path: &RepoPath,
         disk_path: &Path,
     ) -> Result<FileId, SnapshotError> {
-        let mut file = File::open(disk_path).map_err(|err| SnapshotError::Other {
+        let file = File::open(disk_path).map_err(|err| SnapshotError::Other {
             message: format!("Failed to open file {}", disk_path.display()),
             err: err.into(),
         })?;
+        let mut file = std::io::BufReader::with_capacity(eol::PROBE_SIZE, file);
         let target_eol = self
             .target_eol_strategy
-            .get_snapshot_reader_target_eol(disk_path);
+            .get_snapshot_reader_target_eol(disk_path, &mut file);
         let file = file.read_with_eol(target_eol);
         let file_id = self
             .store()

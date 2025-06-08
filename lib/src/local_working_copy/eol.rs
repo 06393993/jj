@@ -31,6 +31,8 @@ use crate::git_backend::GitBackend;
 use crate::repo_path::RepoPath;
 use crate::store::Store;
 
+pub(crate) const PROBE_SIZE: usize = 8 << 10;
+
 /// The target EOL to convert to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TargetEol {
@@ -51,7 +53,11 @@ pub(crate) enum TargetEol {
 }
 
 pub(crate) trait TargetEolStrategy: Sync + Send {
-    fn get_snapshot_reader_target_eol(&self, file_path: &Path) -> TargetEol;
+    fn get_snapshot_reader_target_eol(
+        &self,
+        file_path: &Path,
+        content: &mut std::io::BufReader<std::fs::File>,
+    ) -> TargetEol;
     fn get_update_writer_target_eol<'a>(
         &'a self,
         repo_path: &'a RepoPath,
@@ -79,7 +85,11 @@ pub(crate) fn get_target_eol_strategy(
 struct DefaultTargetEolStrategy;
 
 impl TargetEolStrategy for DefaultTargetEolStrategy {
-    fn get_snapshot_reader_target_eol(&self, _file_path: &Path) -> TargetEol {
+    fn get_snapshot_reader_target_eol(
+        &self,
+        _file_path: &Path,
+        _content: &mut std::io::BufReader<std::fs::File>,
+    ) -> TargetEol {
         TargetEol::PassThrough
     }
 

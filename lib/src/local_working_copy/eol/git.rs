@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fs::File;
 use std::io::Read as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -25,13 +24,11 @@ use tokio::io::AsyncReadExt as _;
 
 use super::TargetEol;
 use super::TargetEolStrategy;
+use super::PROBE_SIZE;
 use crate::backend::FileId;
 use crate::git_backend::GitBackend;
 use crate::repo_path::RepoPath;
 use crate::store::Store;
-
-// Read at most 8KB to decide whether this file is binary.
-const PROBE_SIZE: usize = 8 << 10;
 
 pub(super) struct GitTargetEolStrategy {
     store: Arc<Store>,
@@ -53,13 +50,20 @@ impl GitTargetEolStrategy {
 }
 
 impl TargetEolStrategy for GitTargetEolStrategy {
-    fn get_snapshot_reader_target_eol(&self, file_path: &Path) -> TargetEol {
-        fn is_file_binary(file_path: &Path) -> Option<bool> {
-            let file = File::options().read(true).open(file_path).unwrap();
-
-            let mut first = file.take(PROBE_SIZE as u64);
+    fn get_snapshot_reader_target_eol(
+        &self,
+        file_path: &Path,
+        content: &mut std::io::BufReader<std::fs::File>,
+    ) -> TargetEol {
+        fn is_file_binary(file: &mut std::io::BufReader<std::fs::File>) -> Option<bool> {
+            let mut first = file.by_ref().take(PROBE_SIZE as u64);
             let mut content = Vec::with_capacity(PROBE_SIZE);
-            first.read_to_end(&mut content).ok()?;
+            let read_result = first.read_to_end(&mut content).ok();
+            let _ = file.seek_relative(
+                -(i64::try_from(content.len())
+                    .expect("bytes read shouldn't be larger than PROBE_SIZE")),
+            );
+            read_result?;
             let stats = Stats::from_bytes(&content);
             Some(stats.is_binary())
         }
@@ -68,7 +72,7 @@ impl TargetEolStrategy for GitTargetEolStrategy {
             match auto_crlf {
                 AutoCrlf::Disabled => return TargetEol::PassThrough,
                 AutoCrlf::Enabled | AutoCrlf::Input => {
-                    match is_file_binary(file_path) {
+                    match is_file_binary(content) {
                         Some(true) => return TargetEol::PassThrough,
                         Some(false) => return TargetEol::Lf,
                         None => {
@@ -79,7 +83,7 @@ impl TargetEolStrategy for GitTargetEolStrategy {
             }
         }
 
-        super::DefaultTargetEolStrategy.get_snapshot_reader_target_eol(file_path)
+        super::DefaultTargetEolStrategy.get_snapshot_reader_target_eol(file_path, content)
     }
 
     fn get_update_writer_target_eol<'a>(
