@@ -18,6 +18,7 @@ use jj_lib::matchers::Matcher;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree::TreeDiffEntry;
 use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::working_copy::CheckoutError;
 use jj_lib::working_copy::CheckoutOptions;
@@ -99,10 +100,11 @@ fn check_out(
     tree: &MergedTree,
     sparse_patterns: Vec<RepoPathBuf>,
     options: &CheckoutOptions,
+    user_settings: &UserSettings,
 ) -> Result<TreeState, DiffCheckoutError> {
     std::fs::create_dir(&wc_dir).map_err(DiffCheckoutError::SetUpDir)?;
     std::fs::create_dir(&state_dir).map_err(DiffCheckoutError::SetUpDir)?;
-    let mut tree_state = TreeState::init(store, wc_dir, state_dir)?;
+    let mut tree_state = TreeState::init(store, wc_dir, state_dir, user_settings)?;
     tree_state.set_sparse_patterns(sparse_patterns, options)?;
     tree_state.check_out(tree, options)?;
     Ok(tree_state)
@@ -151,6 +153,7 @@ pub(crate) fn check_out_trees(
     matcher: &dyn Matcher,
     output_is: Option<DiffSide>,
     options: &CheckoutOptions,
+    user_settings: &UserSettings,
 ) -> Result<DiffWorkingCopies, DiffCheckoutError> {
     let changed_files: Vec<_> = left_tree
         .diff_stream(right_tree, matcher)
@@ -170,6 +173,7 @@ pub(crate) fn check_out_trees(
         left_tree,
         changed_files.clone(),
         options,
+        user_settings,
     )?;
     let right_tree_state = check_out(
         store.clone(),
@@ -178,6 +182,7 @@ pub(crate) fn check_out_trees(
         right_tree,
         changed_files.clone(),
         options,
+        user_settings,
     )?;
     let output_tree_state = output_is
         .map(|output_side| {
@@ -193,6 +198,7 @@ pub(crate) fn check_out_trees(
                 },
                 changed_files,
                 options,
+                user_settings,
             )
         })
         .transpose()?;
@@ -212,6 +218,7 @@ pub(crate) struct DiffEditWorkingCopies {
 impl DiffEditWorkingCopies {
     /// Checks out the trees, populates JJ_INSTRUCTIONS, and makes appropriate
     /// sides readonly.
+    #[expect(clippy::too_many_arguments)]
     pub fn check_out(
         store: &Arc<Store>,
         left_tree: &MergedTree,
@@ -220,8 +227,17 @@ impl DiffEditWorkingCopies {
         output_is: Option<DiffSide>,
         instructions: Option<&str>,
         options: &CheckoutOptions,
+        user_settings: &UserSettings,
     ) -> Result<Self, DiffEditError> {
-        let diff_wc = check_out_trees(store, left_tree, right_tree, matcher, output_is, options)?;
+        let diff_wc = check_out_trees(
+            store,
+            left_tree,
+            right_tree,
+            matcher,
+            output_is,
+            options,
+            user_settings,
+        )?;
         let got_output_field = output_is.is_some();
 
         set_readonly_recursively(diff_wc.left_working_copy_path())
