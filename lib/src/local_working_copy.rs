@@ -74,6 +74,11 @@ use crate::conflicts::materialize_tree_value;
 use crate::conflicts::ConflictMarkerStyle;
 use crate::conflicts::MaterializedTreeValue;
 use crate::conflicts::MIN_CONFLICT_MARKER_LEN;
+use crate::eol::convert_eol;
+use crate::eol::convert_eol_async;
+use crate::eol::create_target_eol_strategy;
+use crate::eol::TargetEol;
+use crate::eol::TargetEolStrategy;
 use crate::file_util::check_symlink_support;
 use crate::file_util::copy_async_to_sync;
 use crate::file_util::try_symlink;
@@ -454,6 +459,8 @@ pub struct TreeState {
     /// the repo is configured to use the Watchman filesystem monitor and
     /// Watchman has been queried at least once.
     watchman_clock: Option<crate::protos::working_copy::WatchmanClock>,
+
+    target_eol_strategy: Arc<dyn TargetEolStrategy>,
 }
 
 fn file_state_from_proto(proto: &crate::protos::working_copy::FileState) -> FileState {
@@ -768,9 +775,17 @@ pub enum TreeStateError {
     PersistTreeState { path: PathBuf, source: io::Error },
     #[error("Filesystem monitor error")]
     Fsmonitor(#[source] Box<dyn Error + Send + Sync>),
+    #[error("{message}")]
+    Other {
+        message: String,
+        source: Option<Box<dyn Error + Send + Sync>>,
+    },
 }
 
 impl TreeState {
+    const SYMLINK_SUPPORT_OVERRIDE_SETTING_PATH: &str =
+        "debug.working-copy.symlink-support-override";
+
     pub fn working_copy_path(&self) -> &Path {
         &self.working_copy_path
     }
@@ -795,14 +810,33 @@ impl TreeState {
         store: Arc<Store>,
         working_copy_path: PathBuf,
         state_path: PathBuf,
-        _user_settings: &UserSettings,
+        user_settings: &UserSettings,
     ) -> Result<TreeState, TreeStateError> {
-        let mut wc = TreeState::empty(store, working_copy_path, state_path);
+        let target_eol_strategy = create_target_eol_strategy(Arc::clone(&store), user_settings)
+            .map_err(|source| TreeStateError::Other {
+                message: "failed to create the target EOL strategy".to_string(),
+                source: Some(Box::new(source)),
+            })?;
+        let mut wc = TreeState::empty(
+            store,
+            working_copy_path,
+            state_path,
+            target_eol_strategy,
+            user_settings
+                .get_bool(Self::SYMLINK_SUPPORT_OVERRIDE_SETTING_PATH)
+                .ok(),
+        );
         wc.save()?;
         Ok(wc)
     }
 
-    fn empty(store: Arc<Store>, working_copy_path: PathBuf, state_path: PathBuf) -> TreeState {
+    fn empty(
+        store: Arc<Store>,
+        working_copy_path: PathBuf,
+        state_path: PathBuf,
+        target_eol_strategy: impl TargetEolStrategy + 'static,
+        symlink_support_override: Option<bool>,
+    ) -> TreeState {
         let tree_id = store.empty_merged_tree_id();
         TreeState {
             store,
@@ -812,8 +846,11 @@ impl TreeState {
             file_states: FileStatesMap::new(),
             sparse_patterns: vec![RepoPathBuf::root()],
             own_mtime: MillisSinceEpoch(0),
-            symlink_support: check_symlink_support().unwrap_or(false),
+            symlink_support: symlink_support_override
+                .or_else(|| check_symlink_support().ok())
+                .unwrap_or(false),
             watchman_clock: None,
+            target_eol_strategy: Arc::new(target_eol_strategy),
         }
     }
 
@@ -823,6 +860,11 @@ impl TreeState {
         state_path: PathBuf,
         user_settings: &UserSettings,
     ) -> Result<TreeState, TreeStateError> {
+        let target_eol_strategy = create_target_eol_strategy(Arc::clone(&store), user_settings)
+            .map_err(|source| TreeStateError::Other {
+                message: "failed to create the target EOL strategy".to_string(),
+                source: Some(Box::new(source)),
+            })?;
         let tree_state_path = state_path.join("tree_state");
         let file = match File::open(&tree_state_path) {
             Err(ref err) if err.kind() == io::ErrorKind::NotFound => {
@@ -837,7 +879,15 @@ impl TreeState {
             Ok(file) => file,
         };
 
-        let mut wc = TreeState::empty(store, working_copy_path, state_path);
+        let mut wc = TreeState::empty(
+            store,
+            working_copy_path,
+            state_path,
+            target_eol_strategy,
+            user_settings
+                .get_bool(Self::SYMLINK_SUPPORT_OVERRIDE_SETTING_PATH)
+                .ok(),
+        );
         wc.read(&tree_state_path, file)?;
         Ok(wc)
     }
@@ -1031,6 +1081,7 @@ impl TreeState {
                 progress,
                 max_new_file_size,
                 conflict_marker_style,
+                target_eol_strategy: Arc::clone(&self.target_eol_strategy),
             };
             let directory_to_visit = DirectoryToVisit {
                 dir: RepoPathBuf::root(),
@@ -1178,6 +1229,7 @@ struct FileSnapshotter<'a> {
     progress: Option<&'a SnapshotProgress<'a>>,
     max_new_file_size: u64,
     conflict_marker_style: ConflictMarkerStyle,
+    target_eol_strategy: Arc<dyn TargetEolStrategy>,
 }
 
 impl FileSnapshotter<'_> {
@@ -1557,10 +1609,28 @@ impl FileSnapshotter<'_> {
             // If the file contained a conflict before and is a normal file on
             // disk, we try to parse any conflict markers in the file into a
             // conflict.
-            let content = fs::read(disk_path).map_err(|err| SnapshotError::Other {
-                message: format!("Failed to open file {}", disk_path.display()),
-                err: err.into(),
-            })?;
+            let target_eol = self
+                .target_eol_strategy
+                .get_target_eol_for_snapshot(disk_path)
+                .map_err(|err| SnapshotError::Other {
+                    message: "failed to obtain the target EOL".to_string(),
+                    err,
+                })?;
+            let file =
+                File::options()
+                    .read(true)
+                    .open(disk_path)
+                    .map_err(|err| SnapshotError::Other {
+                        message: format!("Failed to open file {}", disk_path.display()),
+                        err: err.into(),
+                    })?;
+            let mut content = vec![];
+            convert_eol(file, target_eol)
+                .read_to_end(&mut content)
+                .map_err(|err| SnapshotError::Other {
+                    message: format!("Failed to read file {}", disk_path.display()),
+                    err: err.into(),
+                })?;
             let new_file_ids = conflicts::update_from_content(
                 &old_file_ids,
                 self.store(),
@@ -1606,10 +1676,18 @@ impl FileSnapshotter<'_> {
         path: &RepoPath,
         disk_path: &Path,
     ) -> Result<FileId, SnapshotError> {
+        let target_eol = self
+            .target_eol_strategy
+            .get_target_eol_for_snapshot(disk_path)
+            .map_err(|err| SnapshotError::Other {
+                message: "failed to obtain the target EOL".to_string(),
+                err,
+            })?;
         let file = File::open(disk_path).map_err(|err| SnapshotError::Other {
             message: format!("Failed to open file {}", disk_path.display()),
             err: err.into(),
         })?;
+        let file = convert_eol(file, target_eol);
         Ok(self
             .store()
             .write_file(path, &mut BlockingAsyncReader::new(file))
@@ -1649,11 +1727,12 @@ impl FileSnapshotter<'_> {
 
 /// Functions to update local-disk files from the store.
 impl TreeState {
-    fn write_file(
+    async fn write_file(
         &self,
         disk_path: &Path,
-        contents: impl AsyncRead,
+        contents: impl AsyncRead + Send + Unpin,
         executable: bool,
+        target_eol: TargetEol,
     ) -> Result<FileState, CheckoutError> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -1663,6 +1742,7 @@ impl TreeState {
                 message: format!("Failed to open file {} for writing", disk_path.display()),
                 err: err.into(),
             })?;
+        let contents = convert_eol_async(contents, target_eol).await;
         let size = copy_async_to_sync(contents, &mut file)
             .block_on()
             .map_err(|err| CheckoutError::Other {
@@ -1899,13 +1979,28 @@ impl TreeState {
                     continue;
                 }
                 MaterializedTreeValue::File(file) => {
-                    self.write_file(&disk_path, file.reader, file.executable)?
+                    let target_eol = self
+                        .target_eol_strategy
+                        .get_target_eol_for_update(&path, &file.id)
+                        .await
+                        .map_err(|err| CheckoutError::Other {
+                            message: "failed to retrieve the target EOL".to_string(),
+                            err,
+                        })?;
+                    self.write_file(&disk_path, file.reader, file.executable, target_eol)
+                        .await?
                 }
                 MaterializedTreeValue::Symlink { id: _, target } => {
                     if self.symlink_support {
                         self.write_symlink(&disk_path, target)?
                     } else {
-                        self.write_file(&disk_path, target.as_bytes(), false)?
+                        self.write_file(
+                            &disk_path,
+                            target.as_bytes(),
+                            false,
+                            TargetEol::PassThrough,
+                        )
+                        .await?
                     }
                 }
                 MaterializedTreeValue::GitSubmodule(_) => {

@@ -42,7 +42,7 @@ digest = { workspace = true }
 dunce = { workspace = true }
 either = { workspace = true }
 futures = { workspace = true }
-gix = { workspace = true, optional = true }
+gix = { workspace = true }
 glob = { workspace = true }
 hashbrown = { workspace = true }
 hex = { workspace = true }
@@ -96,7 +96,7 @@ tokio = { workspace = true, features = ["full"] }
 
 [features]
 default = ["git"]
-git = ["dep:gix"]
+git = []
 watchman = ["dep:watchman_client"]
 testing = ["git"]
 
