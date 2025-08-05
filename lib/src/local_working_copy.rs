@@ -35,6 +35,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::slice;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::mpsc::Sender;
@@ -42,7 +43,9 @@ use std::sync::mpsc::channel;
 use std::time::UNIX_EPOCH;
 
 use either::Either;
+use futures::stream::FuturesUnordered;
 use futures::StreamExt as _;
+use futures::TryStreamExt;
 use itertools::EitherOrBoth;
 use itertools::Itertools as _;
 use once_cell::unsync::OnceCell;
@@ -1896,12 +1899,14 @@ impl TreeState {
     ) -> Result<CheckoutStats, CheckoutError> {
         // TODO: maybe it's better not include the skipped counts in the "intended"
         // counts
-        let mut stats = CheckoutStats {
-            updated_files: 0,
-            added_files: 0,
-            removed_files: 0,
-            skipped_files: 0,
-        };
+        let updated_files = AtomicU32::new(0);
+        let added_files = AtomicU32::new(0);
+        let removed_files = AtomicU32::new(0);
+        let skipped_files = AtomicU32::new(0);
+        enum FileEntryChange {
+            Changed(RepoPathBuf, FileState),
+            Deleted(RepoPathBuf),
+        }
         let mut changed_file_states = Vec::new();
         let mut deleted_files = HashSet::new();
         let mut diff_stream = old_tree
@@ -1914,111 +1919,131 @@ impl TreeState {
                 Err(err) => (path, Err(err)),
             })
             .buffered(self.store.concurrency().max(1));
+        let futures = FuturesUnordered::new();
         while let Some((path, data)) = diff_stream.next().await {
-            let (before, after) = data?;
-            if after.is_absent() {
-                stats.removed_files += 1;
-            } else if before.is_absent() {
-                stats.added_files += 1;
-            } else {
-                stats.updated_files += 1;
-            }
+            futures.push(async {
+                let (before, after) = data?;
+                if after.is_absent() {
+                    removed_files.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                } else if before.is_absent() {
+                    added_files.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    updated_files.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
 
-            // Existing Git submodule can be a non-empty directory on disk. We
-            // shouldn't attempt to manage it as a tracked path.
-            //
-            // TODO: It might be better to add general support for paths not
-            // tracked by jj than processing submodules specially. For example,
-            // paths excluded by .gitignore can be marked as such so that
-            // newly-"unignored" paths won't be snapshotted automatically.
-            if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_)))
-                && matches!(after, MaterializedTreeValue::GitSubmodule(_))
-            {
-                eprintln!("ignoring git submodule at {path:?}");
-                // Not updating the file state as if there were no diffs. Leave
-                // the state type as FileType::GitSubmodule if it was before.
-                continue;
-            }
+                // Existing Git submodule can be a non-empty directory on disk. We
+                // shouldn't attempt to manage it as a tracked path.
+                //
+                // TODO: It might be better to add general support for paths not
+                // tracked by jj than processing submodules specially. For example,
+                // paths excluded by .gitignore can be marked as such so that
+                // newly-"unignored" paths won't be snapshotted automatically.
+                if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_)))
+                    && matches!(after, MaterializedTreeValue::GitSubmodule(_))
+                {
+                    eprintln!("ignoring git submodule at {path:?}");
+                    // Not updating the file state as if there were no diffs. Leave
+                    // the state type as FileType::GitSubmodule if it was before.
+                    return Ok::<_, CheckoutError>(None);
+                }
 
-            // Create parent directories no matter if after.is_present(). This
-            // ensures that the path never traverses symlinks.
-            let Some(disk_path) = create_parent_dirs(&self.working_copy_path, &path)? else {
-                changed_file_states.push((path, FileState::placeholder()));
-                stats.skipped_files += 1;
-                continue;
-            };
-            // If the path was present, check reserved path first and delete it.
-            let present_file_deleted = before.is_present() && remove_old_file(&disk_path)?;
-            // If not, create temporary file to test the path validity.
-            if !present_file_deleted && !can_create_new_file(&disk_path)? {
-                changed_file_states.push((path, FileState::placeholder()));
-                stats.skipped_files += 1;
-                continue;
-            }
+                // Create parent directories no matter if after.is_present(). This
+                // ensures that the path never traverses symlinks.
+                let Some(disk_path) = create_parent_dirs(&self.working_copy_path, &path)? else {
+                    skipped_files.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(Some(FileEntryChange::Changed(path, FileState::placeholder())));
+                };
+                // If the path was present, check reserved path first and delete it.
+                let present_file_deleted = before.is_present() && remove_old_file(&disk_path)?;
+                // If not, create temporary file to test the path validity.
+                if !present_file_deleted && !can_create_new_file(&disk_path)? {
+                    skipped_files.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(Some(FileEntryChange::Changed(path, FileState::placeholder())));
+                }
 
-            // TODO: Check that the file has not changed before overwriting/removing it.
-            let file_state = match after {
-                MaterializedTreeValue::Absent | MaterializedTreeValue::AccessDenied(_) => {
-                    let mut parent_dir = disk_path.parent().unwrap();
-                    loop {
-                        if fs::remove_dir(parent_dir).is_err() {
-                            break;
+                // TODO: Check that the file has not changed before overwriting/removing it.
+                let file_state = match after {
+                    MaterializedTreeValue::Absent | MaterializedTreeValue::AccessDenied(_) => {
+                        let mut parent_dir = disk_path.parent().unwrap();
+                        loop {
+                            if fs::remove_dir(parent_dir).is_err() {
+                                break;
+                            }
+                            parent_dir = parent_dir.parent().unwrap();
                         }
-                        parent_dir = parent_dir.parent().unwrap();
+                        return Ok(Some(FileEntryChange::Deleted(path)));
                     }
-                    deleted_files.insert(path);
-                    continue;
-                }
-                MaterializedTreeValue::File(file) => {
-                    self.write_file(&disk_path, file.reader, file.executable, true)
-                        .await?
-                }
-                MaterializedTreeValue::Symlink { id: _, target } => {
-                    if self.symlink_support {
-                        self.write_symlink(&disk_path, target)?
-                    } else {
-                        self.write_file(&disk_path, target.as_bytes(), false, false)
+                    MaterializedTreeValue::File(file) => {
+                        self.write_file(&disk_path, file.reader, file.executable, true)
                             .await?
                     }
-                }
-                MaterializedTreeValue::GitSubmodule(_) => {
-                    eprintln!("ignoring git submodule at {path:?}");
-                    FileState::for_gitsubmodule()
-                }
-                MaterializedTreeValue::Tree(_) => {
-                    panic!("unexpected tree entry in diff at {path:?}");
-                }
-                MaterializedTreeValue::FileConflict(file) => {
-                    let conflict_marker_len =
-                        choose_materialized_conflict_marker_len(&file.contents);
-                    let data = materialize_merge_result_to_bytes_with_marker_len(
-                        &file.contents,
-                        conflict_marker_style,
-                        conflict_marker_len,
-                    )
-                    .into();
-                    let materialized_conflict_data = MaterializedConflictData {
-                        conflict_marker_len: conflict_marker_len.try_into().unwrap_or(u32::MAX),
-                    };
-                    self.write_conflict(
-                        &disk_path,
-                        data,
-                        file.executable.unwrap_or(false),
-                        Some(materialized_conflict_data),
-                    )
-                    .await?
-                }
-                MaterializedTreeValue::OtherConflict { id } => {
-                    // Unless all terms are regular files, we can't do much
-                    // better than trying to describe the merge.
-                    let data = id.describe().into_bytes();
-                    let executable = false;
-                    self.write_conflict(&disk_path, data, executable, None)
+                    MaterializedTreeValue::Symlink { id: _, target } => {
+                        if self.symlink_support {
+                            self.write_symlink(&disk_path, target)?
+                        } else {
+                            self.write_file(&disk_path, target.as_bytes(), false, false)
+                                .await?
+                        }
+                    }
+                    MaterializedTreeValue::GitSubmodule(_) => {
+                        eprintln!("ignoring git submodule at {path:?}");
+                        FileState::for_gitsubmodule()
+                    }
+                    MaterializedTreeValue::Tree(_) => {
+                        panic!("unexpected tree entry in diff at {path:?}");
+                    }
+                    MaterializedTreeValue::FileConflict(file) => {
+                        let conflict_marker_len =
+                            choose_materialized_conflict_marker_len(&file.contents);
+                        let data = materialize_merge_result_to_bytes_with_marker_len(
+                            &file.contents,
+                            conflict_marker_style,
+                            conflict_marker_len,
+                        )
+                        .into();
+                        let materialized_conflict_data = MaterializedConflictData {
+                            conflict_marker_len: conflict_marker_len.try_into().unwrap_or(u32::MAX),
+                        };
+                        self.write_conflict(
+                            &disk_path,
+                            data,
+                            file.executable.unwrap_or(false),
+                            Some(materialized_conflict_data),
+                        )
                         .await?
-                }
-            };
-            changed_file_states.push((path, file_state));
+                    }
+                    MaterializedTreeValue::OtherConflict { id } => {
+                        // Unless all terms are regular files, we can't do much
+                        // better than trying to describe the merge.
+                        let data = id.describe().into_bytes();
+                        let executable = false;
+                        self.write_conflict(&disk_path, data, executable, None)
+                            .await?
+                    }
+                };
+                Ok(Some(FileEntryChange::Changed(path, file_state)))
+            });
         }
+        let changes = futures.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>, _>>()?;
+        for change in changes {
+            let Some(change) = change else {
+                continue;
+            };
+            match change {
+                FileEntryChange::Changed(path, file_state) => {
+                    changed_file_states.push((path, file_state));
+                }
+                FileEntryChange::Deleted(path) => {
+                    deleted_files.insert(path);
+                }
+            }
+        }
+        let stats = CheckoutStats {
+            updated_files: updated_files.load(std::sync::atomic::Ordering::SeqCst),
+            added_files: added_files.load(std::sync::atomic::Ordering::SeqCst),
+            removed_files: removed_files.load(std::sync::atomic::Ordering::SeqCst),
+            skipped_files: skipped_files.load(std::sync::atomic::Ordering::SeqCst),
+        };
         self.file_states
             .merge_in(changed_file_states, &deleted_files);
         Ok(stats)
