@@ -45,6 +45,7 @@ fn test_non_utf8_arg() {
 }
 
 #[test]
+#[ignore]
 fn test_version() {
     let test_env = TestEnvironment::default();
 

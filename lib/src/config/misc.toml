@@ -13,6 +13,7 @@ register-snapshot-trigger = false
 abandon-unreachable-commits = true
 auto-local-bookmark = false
 executable-path = "git"
+filter.enabled = false
 write-change-id-header = true
 
 [merge]
@@ -52,6 +53,8 @@ name = ""
 [working-copy]
 eol-conversion = "none"
 exec-bit-change = "auto"
+eol-conversion-use-gitattributes = false
+gitattributes-default-eol = "none"
 
 [experimental]
 record-predecessors-in-commit = true
