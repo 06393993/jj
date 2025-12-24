@@ -479,7 +479,7 @@ pub fn materialize_merge_result_to_bytes<T: AsRef<[u8]>>(
 ) -> BString {
     let merge_result = files::merge_hunks(single_hunk, &options.merge);
     match merge_result {
-        MergeResult::Resolved(content) => content,
+        MergeResult::Resolved(content) => content.into_owned(),
         MergeResult::Conflict(hunks) => {
             let marker_len = options
                 .marker_len
@@ -1070,7 +1070,7 @@ pub async fn update_from_content(
     // Check if the new hunks are unchanged. This makes sure that unchanged file
     // conflicts aren't updated to partially-resolved contents.
     let unchanged = match (&old_hunks, &new_hunks) {
-        (MergeResult::Resolved(old), None) => old == content,
+        (MergeResult::Resolved(old), None) => old.as_ref() == content,
         (MergeResult::Conflict(old), Some(new)) => old == new,
         (MergeResult::Resolved(_), Some(_)) | (MergeResult::Conflict(_), None) => false,
     };

@@ -596,7 +596,7 @@ fn make_merge_sections(
     let mut sections = Vec::new();
     match merge_result {
         MergeResult::Resolved(buf) => {
-            let contents = buf_to_file_contents(None, buf.into());
+            let contents = buf_to_file_contents(None, buf.into_owned().into());
             let section = match contents {
                 FileContents::Absent => None,
                 FileContents::Text {

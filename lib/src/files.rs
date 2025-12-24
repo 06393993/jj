@@ -15,6 +15,7 @@
 #![expect(missing_docs)]
 
 use std::borrow::Borrow;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::iter;
 use std::mem;
@@ -275,9 +276,9 @@ pub enum FileMergeHunkLevel {
 /// Merge result in either fully-resolved or conflicts form, akin to
 /// `Result<BString, Vec<Merge<BString>>>`.
 #[derive(PartialEq, Eq, Clone, Debug)]
-pub enum MergeResult {
+pub enum MergeResult<'a> {
     /// Resolved content if inputs can be merged successfully.
-    Resolved(BString),
+    Resolved(Cow<'a, BStr>),
     /// List of partially-resolved hunks if some of them cannot be merged.
     Conflict(Vec<Merge<BString>>),
 }
@@ -285,7 +286,10 @@ pub enum MergeResult {
 /// Splits `inputs` into hunks, resolves trivial merge conflicts for each.
 ///
 /// Returns either fully-resolved content or list of partially-resolved hunks.
-pub fn merge_hunks<T: AsRef<[u8]>>(inputs: &Merge<T>, options: &MergeOptions) -> MergeResult {
+pub fn merge_hunks<'a, T: AsRef<[u8]>>(
+    inputs: &'a Merge<T>,
+    options: &'a MergeOptions,
+) -> MergeResult<'a> {
     merge_inner(inputs, options)
 }
 
@@ -386,7 +390,7 @@ trait FromMergeHunks<'input>: Sized {
     fn from_hunks<I: IntoIterator<Item = MergeHunk<'input>>>(hunks: I) -> Self;
 }
 
-impl<'input> FromMergeHunks<'input> for MergeResult {
+impl<'input> FromMergeHunks<'input> for MergeResult<'input> {
     fn from_hunks<I: IntoIterator<Item = MergeHunk<'input>>>(hunks: I) -> Self {
         collect_hunks(hunks)
     }
@@ -406,7 +410,9 @@ impl<'input> FromMergeHunks<'input> for Option<BString> {
 
 /// Collects merged hunks into either fully-resolved content or list of
 /// partially-resolved hunks.
-fn collect_hunks<'input>(hunks: impl IntoIterator<Item = MergeHunk<'input>>) -> MergeResult {
+fn collect_hunks<'input>(
+    hunks: impl IntoIterator<Item = MergeHunk<'input>>,
+) -> MergeResult<'input> {
     let mut resolved_hunk = BString::new(vec![]);
     let mut merge_hunks: Vec<Merge<BString>> = vec![];
     for hunk in hunks {
@@ -422,7 +428,7 @@ fn collect_hunks<'input>(hunks: impl IntoIterator<Item = MergeHunk<'input>>) -> 
     }
 
     if merge_hunks.is_empty() {
-        MergeResult::Resolved(resolved_hunk)
+        MergeResult::Resolved(Cow::Owned(resolved_hunk))
     } else {
         if !resolved_hunk.is_empty() {
             merge_hunks.push(Merge::resolved(resolved_hunk));
@@ -852,50 +858,54 @@ mod tests {
 
     #[test]
     fn test_merge_single_hunk() {
-        let options = MergeOptions {
-            hunk_level: FileMergeHunkLevel::Line,
-            same_change: SameChange::Accept,
-        };
-        let merge_hunks = |inputs: &_| merge_hunks(inputs, &options);
+        fn merge_hunks<'a>(inputs: &'a Merge<BString>) -> MergeResult<'a> {
+            super::merge_hunks(
+                inputs,
+                &MergeOptions {
+                    hunk_level: FileMergeHunkLevel::Line,
+                    same_change: SameChange::Accept,
+                },
+            )
+        }
         // Unchanged and empty on all sides
         assert_eq!(
             merge_hunks(&conflict([b"", b"", b""])),
-            MergeResult::Resolved(hunk(b""))
+            MergeResult::Resolved(Cow::Owned(hunk(b"")))
         );
         // Unchanged on all sides
         assert_eq!(
             merge_hunks(&conflict([b"a", b"a", b"a"])),
-            MergeResult::Resolved(hunk(b"a"))
+            MergeResult::Resolved(Cow::Owned(hunk(b"a")))
         );
         // One side removed, one side unchanged
         assert_eq!(
             merge_hunks(&conflict([b"", b"a\n", b"a\n"])),
-            MergeResult::Resolved(hunk(b""))
+            MergeResult::Resolved(Cow::Owned(hunk(b"")))
         );
         // One side unchanged, one side removed
         assert_eq!(
             merge_hunks(&conflict([b"a\n", b"a\n", b""])),
-            MergeResult::Resolved(hunk(b""))
+            MergeResult::Resolved(Cow::Owned(hunk(b"")))
         );
         // Both sides removed same line
         assert_eq!(
             merge_hunks(&conflict([b"", b"a\n", b""])),
-            MergeResult::Resolved(hunk(b""))
+            MergeResult::Resolved(Cow::Owned(hunk(b"")))
         );
         // One side modified, one side unchanged
         assert_eq!(
             merge_hunks(&conflict([b"a b", b"a", b"a"])),
-            MergeResult::Resolved(hunk(b"a b"))
+            MergeResult::Resolved(Cow::Owned(hunk(b"a b")))
         );
         // One side unchanged, one side modified
         assert_eq!(
             merge_hunks(&conflict([b"a", b"a", b"a b"])),
-            MergeResult::Resolved(hunk(b"a b"))
+            MergeResult::Resolved(Cow::Owned(hunk(b"a b")))
         );
         // All sides added same content
         assert_eq!(
             merge_hunks(&conflict([b"a\n", b"", b"a\n", b"", b"a\n"])),
-            MergeResult::Resolved(hunk(b"a\n"))
+            MergeResult::Resolved(Cow::Owned(hunk(b"a\n")))
         );
         // One side modified, two sides added
         assert_eq!(
@@ -905,7 +915,7 @@ mod tests {
         // All sides removed same content
         assert_eq!(
             merge_hunks(&conflict([b"", b"a\n", b"", b"a\n", b"", b"a\n", b""])),
-            MergeResult::Resolved(hunk(b""))
+            MergeResult::Resolved(Cow::Owned(hunk(b"")))
         );
         // One side modified, two sides removed
         assert_eq!(
@@ -915,7 +925,7 @@ mod tests {
         // Three sides made the same change
         assert_eq!(
             merge_hunks(&conflict([b"b", b"a", b"b", b"a", b"b"])),
-            MergeResult::Resolved(hunk(b"b"))
+            MergeResult::Resolved(Cow::Owned(hunk(b"b")))
         );
         // One side removed, one side modified
         assert_eq!(
@@ -935,12 +945,12 @@ mod tests {
         // Two of three sides don't change, third side changes
         assert_eq!(
             merge_hunks(&conflict([b"a", b"a", b"", b"a", b"a"])),
-            MergeResult::Resolved(hunk(b""))
+            MergeResult::Resolved(Cow::Owned(hunk(b"")))
         );
         // One side unchanged, two other sides make the same change
         assert_eq!(
             merge_hunks(&conflict([b"b", b"a", b"a", b"a", b"b"])),
-            MergeResult::Resolved(hunk(b"b"))
+            MergeResult::Resolved(Cow::Owned(hunk(b"b")))
         );
         // One side unchanged, two other sides make the different change
         assert_eq!(
@@ -952,7 +962,7 @@ mod tests {
         // first.
         assert_eq!(
             merge_hunks(&conflict([b"b", b"a", b"a", b"b", b"c"])),
-            MergeResult::Resolved(hunk(b"c"))
+            MergeResult::Resolved(Cow::Owned(hunk(b"c")))
         );
         // Merge of an unresolved conflict and another branch.
         assert_eq!(
@@ -968,13 +978,15 @@ mod tests {
 
     #[test]
     fn test_merge_multi_hunk() {
-        let options = MergeOptions {
+        static OPTIONS: MergeOptions = MergeOptions {
             hunk_level: FileMergeHunkLevel::Line,
             same_change: SameChange::Accept,
         };
-        let merge_hunks = |inputs: &_| merge_hunks(inputs, &options);
-        let merge = |inputs: &_| merge(inputs, &options);
-        let try_merge = |inputs: &_| try_merge(inputs, &options);
+        fn merge_hunks<'a>(inputs: &'a Merge<BString>) -> MergeResult<'a> {
+            super::merge_hunks(inputs, &OPTIONS)
+        }
+        let merge = |inputs: &_| merge(inputs, &OPTIONS);
+        let try_merge = |inputs: &_| try_merge(inputs, &OPTIONS);
         // Two sides left one line unchanged, and added conflicting additional lines
         let inputs = conflict([b"a\nb\n", b"a\n", b"a\nc\n"]);
         assert_eq!(
@@ -988,7 +1000,7 @@ mod tests {
         let inputs = conflict([b"a2\nb\nc\n", b"a\nb\nc\n", b"a\nb\nc2\n"]);
         assert_eq!(
             merge_hunks(&inputs),
-            MergeResult::Resolved(hunk(b"a2\nb\nc2\n"))
+            MergeResult::Resolved(Cow::Owned(hunk(b"a2\nb\nc2\n")))
         );
         assert_eq!(merge(&inputs), resolved(b"a2\nb\nc2\n"));
         assert_eq!(try_merge(&inputs), Some(hunk(b"a2\nb\nc2\n")));
