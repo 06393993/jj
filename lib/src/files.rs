@@ -22,6 +22,7 @@ use std::mem;
 
 use bstr::BStr;
 use bstr::BString;
+use bstr::ByteSlice as _;
 use either::Either;
 use itertools::Itertools as _;
 
@@ -355,7 +356,7 @@ enum MergeHunk<'input> {
     Owned(Merge<BString>),
 }
 
-impl MergeHunk<'_> {
+impl<'input> MergeHunk<'input> {
     fn len(&self) -> usize {
         match self {
             MergeHunk::Borrowed(merge) => merge.as_slice().len(),
@@ -381,6 +382,19 @@ impl MergeHunk<'_> {
         match self {
             MergeHunk::Borrowed(merge) => merge.map(|&s| s.to_owned()),
             MergeHunk::Owned(merge) => merge,
+        }
+    }
+
+    fn into_resolved(self) -> Result<Cow<'input, BStr>, Self> {
+        match self {
+            MergeHunk::Borrowed(merge) => match merge.into_resolved() {
+                Ok(resolved) => Ok(Cow::Borrowed(resolved)),
+                Err(merge) => Err(Self::Borrowed(merge)),
+            },
+            MergeHunk::Owned(merge) => match merge.into_resolved() {
+                Ok(resolved) => Ok(Cow::Owned(resolved)),
+                Err(merge) => Err(Self::Owned(merge)),
+            },
         }
     }
 }
@@ -413,25 +427,32 @@ impl<'input> FromMergeHunks<'input> for Option<BString> {
 fn collect_hunks<'input>(
     hunks: impl IntoIterator<Item = MergeHunk<'input>>,
 ) -> MergeResult<'input> {
-    let mut resolved_hunk = BString::new(vec![]);
+    let mut resolved_hunk = Cow::Borrowed(b"".as_bstr());
     let mut merge_hunks: Vec<Merge<BString>> = vec![];
     for hunk in hunks {
-        if let Some(content) = hunk.as_resolved() {
-            resolved_hunk.extend_from_slice(content);
-        } else {
-            if !resolved_hunk.is_empty() {
-                merge_hunks.push(Merge::resolved(resolved_hunk));
-                resolved_hunk = BString::new(vec![]);
+        match hunk.into_resolved() {
+            Ok(content) => {
+                if resolved_hunk.is_empty() {
+                    resolved_hunk = content;
+                } else {
+                    resolved_hunk.to_mut().extend_from_slice(&content);
+                }
             }
-            merge_hunks.push(hunk.into_owned());
+            Err(hunk) => {
+                if !resolved_hunk.is_empty() {
+                    merge_hunks.push(Merge::resolved(resolved_hunk.into_owned()));
+                    resolved_hunk = Cow::Borrowed(b"".as_bstr());
+                }
+                merge_hunks.push(hunk.into_owned());
+            }
         }
     }
 
     if merge_hunks.is_empty() {
-        MergeResult::Resolved(Cow::Owned(resolved_hunk))
+        MergeResult::Resolved(resolved_hunk)
     } else {
         if !resolved_hunk.is_empty() {
-            merge_hunks.push(Merge::resolved(resolved_hunk));
+            merge_hunks.push(Merge::resolved(resolved_hunk.into_owned()));
         }
         MergeResult::Conflict(merge_hunks)
     }
